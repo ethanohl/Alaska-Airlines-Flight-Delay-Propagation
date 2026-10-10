@@ -1,0 +1,427 @@
+"""
+Task 1: Load one month of BTS on-time data and filter to Alaska Airlines.
+"""
+
+import pandas as pd
+
+pd.set_option("display.max_columns", None)
+pd.set_option("display.width", 200)
+
+# --- Step 1: Point to ONE month's zip file -----------------------------------
+ZIP_PATH = "data/raw/ontime_2026_07.zip"
+
+# --- Step 2: Choose only the columns we need ---------------------------------
+COLUMNS = [
+    # When
+    "FL_DATE", "DAY_OF_WEEK",
+    # Who
+    "OP_UNIQUE_CARRIER", "TAIL_NUM", "OP_CARRIER_FL_NUM",
+    # Where
+    "ORIGIN", "DEST", "DISTANCE",
+    # Departure
+    "CRS_DEP_TIME", "DEP_TIME", "DEP_DELAY",
+    # Arrival
+    "CRS_ARR_TIME", "ARR_TIME", "ARR_DELAY",
+    # Disruptions
+    "CANCELLED", "DIVERTED", "DIV_REACHED_DEST", "DIV_ARR_DELAY",
+    # Delay causes (blank unless the flight arrived 15+ min late)
+    "CARRIER_DELAY", "WEATHER_DELAY", "NAS_DELAY", "SECURITY_DELAY", "LATE_AIRCRAFT_DELAY",
+]
+
+# --- Step 3: Load the file ---------------------------------------------------
+all_flights = pd.read_csv(ZIP_PATH, usecols=COLUMNS, low_memory=False)
+print("All airlines:", all_flights.shape)
+
+# --- Step 4: Filter to Alaska Airlines ---------------------------------------
+alaska = all_flights[all_flights["OP_UNIQUE_CARRIER"] == "AS"].copy()
+print("Alaska only: ", alaska.shape)
+
+# Convert the date from text ("7/9/2026 12:00:00 AM") to a real date
+alaska["FL_DATE"] = pd.to_datetime(alaska["FL_DATE"], format="%m/%d/%Y %I:%M:%S %p")
+
+# --- Step 5: Inspect what we got ---------------------------------------------
+print("\nFirst 5 rows:")
+print(alaska.head())
+
+print("\nColumn data types:")
+print(alaska.dtypes)
+
+print("\nMissing values per column:")
+print(alaska.isna().sum())
+
+print("\nTop 10 origin airports:")
+print(alaska["ORIGIN"].value_counts().head(10))
+
+print("\nDate range:", alaska["FL_DATE"].min().date(), "to", alaska["FL_DATE"].max().date())
+print("Unique days:", alaska["FL_DATE"].nunique())
+
+"""
+Task 2: Load all 12 months of BTS on-time data, filter to Alaska Airlines,
+combine into one table, and save it for the next tasks.
+ 
+Before running:  pip install pandas pyarrow
+"""
+ 
+from pathlib import Path
+import pandas as pd
+ 
+pd.set_option("display.max_columns", None)
+pd.set_option("display.width", 200)
+ 
+RAW_DIR = Path("data/raw")
+OUT_DIR = Path("data/processed")
+OUT_DIR.mkdir(parents=True, exist_ok=True)   # creates the folder if missing
+ 
+COLUMNS = [
+    "FL_DATE", "DAY_OF_WEEK",
+    "OP_UNIQUE_CARRIER", "TAIL_NUM", "OP_CARRIER_FL_NUM",
+    "ORIGIN", "DEST", "DISTANCE",
+    "CRS_DEP_TIME", "DEP_TIME", "DEP_DELAY",
+    "CRS_ARR_TIME", "ARR_TIME", "ARR_DELAY",
+    "CANCELLED", "DIVERTED", "DIV_REACHED_DEST", "DIV_ARR_DELAY",
+    "CARRIER_DELAY", "WEATHER_DELAY", "NAS_DELAY", "SECURITY_DELAY", "LATE_AIRCRAFT_DELAY",
+]
+ 
+ 
+def load_month(zip_path: Path) -> pd.DataFrame:
+    """Load one month's zip and return only Alaska flights (same steps as Task 1)."""
+    df = pd.read_csv(zip_path, usecols=COLUMNS, low_memory=False)
+    df = df[df["OP_UNIQUE_CARRIER"] == "AS"].copy()
+    df["FL_DATE"] = pd.to_datetime(df["FL_DATE"], format="%m/%d/%Y %I:%M:%S %p")
+    return df
+ 
+ 
+# --- Step 1: Find all the zip files ------------------------------------------
+zip_files = sorted(RAW_DIR.glob("*.zip"))
+print(f"Found {len(zip_files)} files")
+if len(zip_files) != 12:
+    print("WARNING: expected 12 files - check data/raw")
+ 
+# --- Step 2: Load each month, checking the filename matches the data --------
+monthly_tables = []
+for zip_path in zip_files:
+    month_df = load_month(zip_path)
+ 
+    # Which month is actually inside the file?
+    months_inside = month_df["FL_DATE"].dt.strftime("%Y_%m").unique()
+    label = months_inside[0] if len(months_inside) == 1 else "MIXED?"
+    flag = "" if label in zip_path.name else "   <-- filename doesn't match data!"
+ 
+    print(f"  {zip_path.name:25} {len(month_df):>7,} Alaska flights   (data is {label}){flag}")
+    monthly_tables.append(month_df)
+ 
+# --- Step 3: Combine into one table ------------------------------------------
+alaska = pd.concat(monthly_tables, ignore_index=True)
+ 
+# --- Step 4: Check the combined result ---------------------------------------
+print(f"\nCombined: {alaska.shape[0]:,} flights, {alaska.shape[1]} columns")
+print("Date range:", alaska["FL_DATE"].min().date(), "to", alaska["FL_DATE"].max().date())
+print("Unique days:", alaska["FL_DATE"].nunique(), "(expect ~365)")
+ 
+print("\nFlights per month:")
+print(alaska.groupby(alaska["FL_DATE"].dt.to_period("M")).size().to_string())
+ 
+dupes = alaska.duplicated(subset=["FL_DATE", "OP_CARRIER_FL_NUM", "ORIGIN", "DEST"]).sum()
+print(f"\nDuplicate flights (expect 0): {dupes:,}")
+ 
+# --- Step 5: Save so later tasks don't have to re-read the zips --------------
+out_path = OUT_DIR / "alaska_raw_12mo.parquet"
+alaska.to_parquet(out_path, index=False)
+
+
+"""
+Task 3: Clean the 12-month Alaska dataset.
+  - Drop cancelled flights, diverted flights, and rows missing key data
+  - Record how many rows each step removes (these numbers go in your memo)
+  - Fill blank delay-cause columns with 0
+  - Save a clean file for Task 4
+ 
+Input:  data/processed/alaska_raw_12mo.parquet   (from Task 2)
+Output: data/processed/alaska_clean.parquet
+"""
+ 
+from pathlib import Path
+import pandas as pd
+ 
+pd.set_option("display.max_columns", None)
+pd.set_option("display.width", 200)
+ 
+IN_PATH = Path("data/processed/alaska_raw_12mo.parquet")
+OUT_PATH = Path("data/processed/alaska_clean.parquet")
+ 
+CAUSE_COLS = ["CARRIER_DELAY", "WEATHER_DELAY", "NAS_DELAY",
+              "SECURITY_DELAY", "LATE_AIRCRAFT_DELAY"]
+ 
+df = pd.read_parquet(IN_PATH)
+start_rows = len(df)
+print(f"Starting flights: {start_rows:,}\n")
+ 
+# Keep a log of every cleaning step so you can report it later
+cleaning_log = []
+ 
+ 
+def drop_step(data: pd.DataFrame, keep_mask: pd.Series, reason: str) -> pd.DataFrame:
+    """Keep rows where keep_mask is True, and log how many were removed."""
+    removed = int((~keep_mask).sum())
+    cleaning_log.append({"step": reason, "removed": removed,
+                         "pct_of_start": removed / start_rows})
+    return data[keep_mask].copy()
+ 
+ 
+# --- Step 1: Remove cancelled flights ----------------------------------------
+# A cancelled flight never flew, so it has no turn time or delay to measure.
+df = drop_step(df, df["CANCELLED"] == 0, "Cancelled")
+ 
+# --- Step 2: Remove diverted flights -----------------------------------------
+# A diverted flight didn't arrive where scheduled, so its "turn" at the
+# planned destination never happened. (Rare - usually well under 1%.)
+df = drop_step(df, df["DIVERTED"] == 0, "Diverted")
+ 
+# --- Step 3: Remove rows missing a tail number -------------------------------
+# Without a tail number we can't tell which plane flew it -> can't build rotations.
+df = drop_step(df, df["TAIL_NUM"].notna(), "Missing tail number")
+ 
+# --- Step 4: Remove rows missing departure or arrival delay ------------------
+# These should be ~0 after removing cancellations/diversions; this is a safety net.
+has_delays = df["DEP_DELAY"].notna() & df["ARR_DELAY"].notna()
+df = drop_step(df, has_delays, "Missing dep/arr delay")
+ 
+# --- Step 5: Fill blank delay causes with 0 ----------------------------------
+# BTS only fills these when a flight arrives 15+ min late. Blank = no delay
+# attributed, so 0 is the correct value (not "unknown").
+df[CAUSE_COLS] = df[CAUSE_COLS].fillna(0)
+ 
+# Diversion columns are no longer needed after dropping diverted flights
+df = df.drop(columns=["CANCELLED", "DIVERTED", "DIV_REACHED_DEST", "DIV_ARR_DELAY"])
+ 
+# --- Report ------------------------------------------------------------------
+log = pd.DataFrame(cleaning_log)
+log["pct_of_start"] = (log["pct_of_start"] * 100).round(2).astype(str) + "%"
+print("Cleaning log:")
+print(log.to_string(index=False))
+print(f"\nFlights kept: {len(df):,} ({len(df) / start_rows:.1%} of start)")
+ 
+# --- Sanity checks -----------------------------------------------------------
+print("\nRemaining missing values (expect 0 except DEP_TIME/ARR_TIME):")
+missing = df.isna().sum()
+missing = missing[missing > 0]
+print(missing.to_string() if len(missing) else "  none")
+ 
+# Delay causes should add up to the arrival delay for flights 15+ min late
+late = df[df["ARR_DELAY"] >= 15]
+cause_total = late[CAUSE_COLS].sum(axis=1)
+match_rate = (cause_total == late["ARR_DELAY"]).mean()
+print(f"\nFlights arriving 15+ min late: {len(late):,} ({len(late) / len(df):.1%})")
+print(f"Delay causes sum to arrival delay: {match_rate:.1%} of those (expect ~100%)")
+ 
+print("\nShare of late-arrival delay minutes by cause:")
+print((late[CAUSE_COLS].sum() / late[CAUSE_COLS].sum().sum() * 100)
+      .round(1).astype(str).add("%").to_string())
+ 
+df.to_parquet(OUT_PATH, index=False)
+print(f"\nSaved -> {OUT_PATH}")
+log.to_csv(OUT_PATH.with_name("cleaning_log.csv"), index=False)
+print(f"Saved -> {OUT_PATH.with_name('cleaning_log.csv')}")
+
+"""
+Task 4: Convert BTS clock times (e.g. 705 = 07:05) into real timestamps.
+
+Creates four columns:
+  sched_dep, sched_arr   - scheduled departure / arrival (local airport time)
+  actual_dep, actual_arr - actual departure / arrival  (local airport time)
+
+Input:  data/processed/alaska_clean.parquet  (from Task 3)
+Output: data/processed/alaska_times.parquet
+"""
+
+from pathlib import Path
+import pandas as pd
+
+pd.set_option("display.max_columns", None)
+pd.set_option("display.width", 200)
+
+IN_PATH = Path("data/processed/alaska_clean.parquet")
+OUT_PATH = Path("data/processed/alaska_times.parquet")
+
+df = pd.read_parquet(IN_PATH)
+print(f"Flights: {len(df):,}")
+
+
+def hhmm_to_minutes(hhmm: pd.Series) -> pd.Series:
+    """705 -> 425 minutes after midnight (7*60 + 5). 2400 -> 1440 (midnight)."""
+    hhmm = hhmm.astype(int)
+    return (hhmm // 100) * 60 + (hhmm % 100)
+
+
+# --- Step 1: Scheduled times as "minutes after midnight" ---------------------
+dep_min = hhmm_to_minutes(df["CRS_DEP_TIME"])
+arr_min = hhmm_to_minutes(df["CRS_ARR_TIME"])
+
+# --- Step 2: Scheduled departure timestamp -----------------------------------
+df["sched_dep"] = df["FL_DATE"] + pd.to_timedelta(dep_min, unit="m")
+
+# --- Step 3: Scheduled arrival timestamp (handle overnight flights) ----------
+# BTS gives only a clock time for arrival, not a date. If the arrival clock
+# time is EARLIER than the departure clock time, the flight landed the next
+# day (e.g. HNL 22:00 -> SEA 06:30).
+# Times are local, so time zones shift clocks - but for Alaska's network no
+# same-day flight lands at an earlier local clock time than it left, so this
+# rule is safe. The check at the bottom verifies it.
+overnight = arr_min < dep_min
+df["sched_arr"] = (df["FL_DATE"]
+                   + pd.to_timedelta(arr_min, unit="m")
+                   + pd.to_timedelta(overnight.astype(int), unit="D"))
+df["overnight_flight"] = overnight
+
+# --- Step 4: Actual times = scheduled time + delay ---------------------------
+# Much easier than parsing DEP_TIME/ARR_TIME, which "wrap" past midnight
+# (a late 23:28 arrival shows up as 3 = 00:03 with no date).
+df["actual_dep"] = df["sched_dep"] + pd.to_timedelta(df["DEP_DELAY"], unit="m")
+df["actual_arr"] = df["sched_arr"] + pd.to_timedelta(df["ARR_DELAY"], unit="m")
+
+# ============================== Sanity checks ================================
+print(f"\nOvernight (red-eye) flights: {overnight.sum():,} ({overnight.mean():.1%})")
+
+# Check 1: our calculated actual times should match BTS's own DEP_TIME/ARR_TIME
+# clock readings. Compare the clock part only (minutes after midnight, mod 24h).
+def clock_minutes(ts: pd.Series) -> pd.Series:
+    return ts.dt.hour * 60 + ts.dt.minute
+
+dep_clock_bts = hhmm_to_minutes(df["DEP_TIME"].fillna(0)) % 1440
+arr_clock_bts = hhmm_to_minutes(df["ARR_TIME"].fillna(0)) % 1440
+dep_match = (clock_minutes(df["actual_dep"]) == dep_clock_bts).mean()
+arr_match = (clock_minutes(df["actual_arr"]) == arr_clock_bts).mean()
+print(f"Actual departure matches BTS DEP_TIME: {dep_match:.2%} (expect ~100%)")
+print(f"Actual arrival matches BTS ARR_TIME:   {arr_match:.2%} (expect ~100%)")
+
+# Check 2: "local clock duration" = sched_arr - sched_dep. Not true flight time
+# (time zones distort it), but it should never be negative or absurdly long.
+clock_dur_hr = (df["sched_arr"] - df["sched_dep"]).dt.total_seconds() / 3600
+print("\nLocal clock duration, hours (sched_arr - sched_dep):")
+print(clock_dur_hr.describe(percentiles=[.01, .5, .99]).round(2).to_string())
+bad = df[(clock_dur_hr <= 0) | (clock_dur_hr > 16)]
+print(f"Suspicious durations (<=0h or >16h): {len(bad):,} (expect 0)")
+if len(bad):
+    print(bad[["FL_DATE", "ORIGIN", "DEST", "CRS_DEP_TIME", "CRS_ARR_TIME"]].head(10))
+
+# Show a few red-eyes so you can eyeball them
+print("\nSample overnight flights:")
+print(df.loc[df["overnight_flight"],
+             ["TAIL_NUM", "ORIGIN", "DEST", "CRS_DEP_TIME", "CRS_ARR_TIME",
+              "sched_dep", "sched_arr", "ARR_DELAY", "actual_arr"]]
+      .head(5).to_string(index=False))
+
+df.to_parquet(OUT_PATH, index=False)
+print(f"\nSaved -> {OUT_PATH}")
+
+"""
+Task 5 + 6: Rebuild each aircraft's rotation and sanity-check it.
+
+For every flight, find the SAME plane's previous flight and compute:
+  sched_turn_min  - scheduled time on the ground between the two flights
+  actual_turn_min - actual time on the ground
+Then group unbroken sequences of flights into "chains" (one plane's day).
+
+Input:  data/processed/alaska_times.parquet   (from Task 4)
+Output: data/processed/alaska_rotations.parquet
+"""
+
+from pathlib import Path
+import pandas as pd
+
+pd.set_option("display.max_columns", None)
+pd.set_option("display.width", 220)
+
+IN_PATH = Path("data/processed/alaska_times.parquet")
+OUT_PATH = Path("data/processed/alaska_rotations.parquet")
+
+MAX_TURN_HOURS = 8   # a gap longer than this = overnight/parked, not a "turn"
+
+df = pd.read_parquet(IN_PATH)
+print(f"Flights: {len(df):,}   Aircraft: {df['TAIL_NUM'].nunique():,}")
+
+# ============================== Task 5 ======================================
+# --- Step 1: Put each plane's flights in time order --------------------------
+df = df.sort_values(["TAIL_NUM", "sched_dep"]).reset_index(drop=True)
+
+# --- Step 2: Look up the same plane's previous flight ------------------------
+# groupby("TAIL_NUM").shift(1) moves every column down one row *within each
+# plane*, so each row can "see" that plane's previous flight.
+prev = df.groupby("TAIL_NUM")[["DEST", "OP_CARRIER_FL_NUM", "sched_arr",
+                                "actual_arr", "ARR_DELAY"]].shift(1)
+df["prev_dest"] = prev["DEST"]
+df["prev_flight"] = prev["OP_CARRIER_FL_NUM"]
+df["prev_arr_delay"] = prev["ARR_DELAY"]
+
+# --- Step 3: Turn times (minutes on the ground between flights) -------------
+df["sched_turn_min"] = (df["sched_dep"] - prev["sched_arr"]).dt.total_seconds() / 60
+df["actual_turn_min"] = (df["actual_dep"] - prev["actual_arr"]).dt.total_seconds() / 60
+
+# --- Step 4: Decide which links are real -------------------------------------
+# Only link two flights if:
+#   (a) the plane departs from where it last landed, AND
+#   (b) the scheduled gap is between 0 and MAX_TURN_HOURS.
+# (a) fails when a flight in between was cancelled/diverted (we dropped it),
+#     so we'd otherwise measure a fake turn across a missing flight.
+# (b) fails for overnight parking or maintenance - not a turn.
+same_airport = df["prev_dest"] == df["ORIGIN"]
+reasonable_gap = df["sched_turn_min"].between(0, MAX_TURN_HOURS * 60)
+df["linked"] = same_airport & reasonable_gap
+
+# Record WHY a flight isn't linked (useful for your memo's limitations)
+df["break_reason"] = "linked"
+df.loc[prev["DEST"].isna(), "break_reason"] = "first flight of plane"
+df.loc[prev["DEST"].notna() & ~same_airport, "break_reason"] = "airport mismatch (missing leg)"
+df.loc[same_airport & ~reasonable_gap, "break_reason"] = "long gap (overnight/parked)"
+
+# Blank out turn info for unlinked flights so it's never used by mistake
+for col in ["prev_dest", "prev_flight", "prev_arr_delay",
+            "sched_turn_min", "actual_turn_min"]:
+    df.loc[~df["linked"], col] = pd.NA
+
+# --- Step 5: Chain IDs -------------------------------------------------------
+# Every unlinked flight starts a new chain. A running total of "chain starts"
+# gives each unbroken sequence its own number.
+df["chain_id"] = (~df["linked"]).cumsum()
+df["leg_in_chain"] = df.groupby("chain_id").cumcount() + 1
+df["chain_length"] = df.groupby("chain_id")["chain_id"].transform("size")
+
+# Flag chains that touch Seattle (your project's focus)
+touches_sea = (df["ORIGIN"] == "SEA") | (df["DEST"] == "SEA")
+df["chain_touches_sea"] = touches_sea.groupby(df["chain_id"]).transform("any")
+
+# ============================== Task 6 ======================================
+linked = df[df["linked"]]
+print("\n--- Sanity checks ---")
+print(f"Linked to a previous flight: {len(linked):,} ({len(linked) / len(df):.1%})  "
+      f"(expect ~70-90%)")
+print("\nWhy flights are not linked:")
+print(df["break_reason"].value_counts().to_string())
+
+print(f"\nChains (plane-sequences): {df['chain_id'].nunique():,}")
+print(f"Average flights per chain:  {df.groupby('chain_id').size().mean():.2f}")
+print(f"Chains touching SEA:        {df.loc[df['chain_touches_sea'], 'chain_id'].nunique():,}")
+
+print("\nScheduled turn time, minutes (expect median ~40-70):")
+print(linked["sched_turn_min"].describe(percentiles=[.05, .25, .5, .75, .95])
+      .round(1).to_string())
+
+neg = (linked["actual_turn_min"] < 0).sum()
+print(f"\nNegative actual turns (plane left before it arrived!): {neg:,} (expect ~0)")
+
+# Median scheduled turn at SEA vs. Hawaii inter-island, as a first comparison
+hawaii = {"HNL", "OGG", "KOA", "LIH", "ITO"}
+inter_island = linked["ORIGIN"].isin(hawaii) & linked["prev_dest"].isin(hawaii)
+print(f"\nMedian scheduled turn at SEA:       {linked.loc[linked['ORIGIN'] == 'SEA', 'sched_turn_min'].median():.0f} min")
+print(f"Median scheduled turn inter-island: {linked.loc[inter_island, 'sched_turn_min'].median():.0f} min")
+
+# Print one real plane-day that touches SEA with 4+ flights
+example = df.loc[df["chain_touches_sea"] & (df["chain_length"] >= 4), "chain_id"].iloc[0]
+print("\nExample rotation (read it like a story):")
+print(df.loc[df["chain_id"] == example,
+             ["TAIL_NUM", "OP_CARRIER_FL_NUM", "ORIGIN", "DEST", "sched_dep",
+              "sched_arr", "DEP_DELAY", "ARR_DELAY", "sched_turn_min",
+              "actual_turn_min", "LATE_AIRCRAFT_DELAY"]].to_string(index=False))
+
+df.to_parquet(OUT_PATH, index=False)
+print(f"\nSaved -> {OUT_PATH}")
